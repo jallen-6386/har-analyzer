@@ -13,4 +13,4 @@ Useful for SOC analysts, incident responders, and threat hunters.
 
 ## Usage
 
-python advanced_har_analyzer.py suspicious.har
+python har_analyzer.py suspicious.har
