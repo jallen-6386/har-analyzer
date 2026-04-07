@@ -253,16 +253,24 @@ def parse_post_data(post_data):
         if key in lowered_text:
             result["field_hits"]["token"].append(key)
 
+    base64_field_hits = []
     for k, vals in fields.items():
         lk = k.lower()
         if lk in SUSPICIOUS_CRED_KEYS:
             result["field_hits"]["cred"].append(lk)
         if lk in SUSPICIOUS_TOKEN_KEYS:
             result["field_hits"]["token"].append(lk)
+        # Flag values that look like encoded/opaque blobs on sensitive field names
+        if lk in SUSPICIOUS_TOKEN_KEYS:
+            for v in vals:
+                if looks_base64ish(v):
+                    base64_field_hits.append(lk)
+                    break
 
     result["parsed_fields"] = dict(fields)
     result["field_hits"]["cred"] = sorted(set(result["field_hits"]["cred"]))
     result["field_hits"]["token"] = sorted(set(result["field_hits"]["token"]))
+    result["field_hits"]["base64_encoded_tokens"] = sorted(set(base64_field_hits))
     return result
 
 
@@ -296,6 +304,7 @@ def score_request(entry):
     post_info = parse_post_data(request.get("postData"))
     cred_hits = post_info["field_hits"]["cred"]
     token_hits = post_info["field_hits"]["token"]
+    b64_token_hits = post_info["field_hits"].get("base64_encoded_tokens", [])
 
     if method == "POST":
         score += 2
@@ -314,6 +323,10 @@ def score_request(entry):
     if token_hits:
         score += 4
         reasons.append(f"Token/session-like fields: {', '.join(token_hits)}")
+
+    if b64_token_hits:
+        score += 3
+        reasons.append(f"Base64-encoded value in token field(s): {', '.join(b64_token_hits)}")
 
     status = int(response.get("status", 0) or 0)
     if status in {301, 302, 303, 307, 308}:
@@ -638,6 +651,7 @@ def analyze_har(har):
         "timeline": timeline,
         "rapid_sequences": rapid_sequences,
         "cross_origin_posts": cross_origin_posts,
+        "third_party_domains": {k: sorted(v) for k, v in request_domain_to_targets.items()},
     }
 
 
@@ -684,6 +698,19 @@ def print_report(results):
     for domain, count in results["domains"][:20]:
         print(f"{domain:<50} {count}")
     print()
+
+    third_party = results.get("third_party_domains", {})
+    if third_party:
+        print("THIRD-PARTY DOMAIN RELATIONSHIPS")
+        print("-" * 80)
+        print("  Resources loaded from domains other than the page origin:\n")
+        for origin, targets in list(third_party.items())[:5]:
+            print(f"  {origin} loaded from:")
+            for t in targets[:20]:
+                print(f"    - {t}")
+            if len(targets) > 20:
+                print(f"    ... {len(targets) - 20} more")
+        print()
 
     if results["cross_origin_posts"]:
         print("*** CROSS-ORIGIN CREDENTIAL/TOKEN POST — PRIMARY PHISHING EXFIL INDICATOR ***")
