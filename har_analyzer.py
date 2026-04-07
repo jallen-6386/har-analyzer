@@ -397,6 +397,74 @@ def build_chain_of_custody(har_path: str, analyst: str, case_id: str) -> dict:
     }
 
 
+def map_mitre_attack(results: dict) -> list:
+    """
+    Map analysis findings to MITRE ATT&CK technique IDs.
+    Returns a list of {technique_id, technique_name, tactic, rationale} dicts.
+    Each entry explains why the technique was matched so analysts can
+    include it directly in incident reports or SIEM rules.
+    """
+    mappings = []
+
+    def add(tid, name, tactic, rationale):
+        mappings.append({
+            "technique_id": tid,
+            "technique_name": name,
+            "tactic": tactic,
+            "rationale": rationale,
+        })
+
+    if results.get("cross_origin_posts"):
+        add("T1557", "Adversary-in-the-Middle", "Collection / Credential Access",
+            "Credentials or tokens POSTed to a domain different from the Referer origin, "
+            "consistent with a reverse-proxy phishing kit intercepting auth flows.")
+
+    if results.get("fake_login_pages"):
+        add("T1056.003", "Input Capture: Web Portal Capture", "Collection",
+            "HTML pages with password input fields detected, indicating credential harvesting.")
+        add("T1566.002", "Phishing: Spearphishing Link", "Initial Access",
+            "Fake login pages present; victim likely directed here via a phishing link.")
+
+    exfil = results.get("exfil_findings", [])
+    cred_exfil = [f for f in exfil if "credential" in f.get("type", "").lower()]
+    token_exfil = [f for f in exfil if "token" in f.get("type", "").lower()]
+
+    if cred_exfil:
+        add("T1552", "Unsecured Credentials", "Credential Access",
+            f"{len(cred_exfil)} request(s) contain credential fields (password, email, username) in POST body.")
+
+    if token_exfil:
+        add("T1539", "Steal Web Session Cookie", "Credential Access",
+            f"{len(token_exfil)} request(s) contain session/token material (access_token, jwt, samlresponse).")
+        add("T1528", "Steal Application Access Token", "Credential Access",
+            "OAuth/SAML token material found in request bodies indicates token theft attempt.")
+
+    if results.get("javascript_hits"):
+        add("T1185", "Browser Session Hijacking", "Collection",
+            "Suspicious JavaScript patterns (document.cookie, localStorage, sendBeacon) detected "
+            "in loaded scripts, consistent with a client-side skimmer or session hijacker.")
+
+    if results.get("reverse_proxy_indicators"):
+        add("T1090", "Proxy", "Command and Control",
+            "Multiple auth-related requests and redirect chains consistent with a reverse-proxy "
+            "phishing infrastructure (e.g. Evilginx, Modlishka).")
+
+    suspicious_reqs = results.get("suspicious_requests", [])
+    if any("xn--" in r.get("domain", "") for r in suspicious_reqs):
+        add("T1036.005", "Masquerading: Match Legitimate Name or Location", "Defense Evasion",
+            "Punycode/IDN domain detected — attacker using a homograph domain to impersonate a trusted site.")
+
+    if any("Bare IP address" in reason for r in suspicious_reqs for reason in r.get("reasons", [])):
+        add("T1071.001", "Application Layer Protocol: Web Protocols", "Command and Control",
+            "Requests to bare IP addresses detected — common in phishing kits to bypass DNS-based blocking.")
+
+    if results.get("tracker_domains"):
+        add("T1217", "Browser Information Discovery", "Discovery",
+            "Tracking/advertising domains observed; may be used for victim fingerprinting or geo-targeting.")
+
+    return mappings
+
+
 def extract_iocs(results: dict) -> dict:
     """
     Deduplicate and categorize Indicators of Compromise from analysis results.
@@ -761,6 +829,15 @@ def print_report(results):
         print(f"- {item}")
     print()
 
+    mitre = results.get("mitre_attack", [])
+    if mitre:
+        print("MITRE ATT&CK TECHNIQUE MAPPING")
+        print("-" * 80)
+        for m in mitre:
+            print(f"  {m['technique_id']}  {m['technique_name']}  [{m['tactic']}]")
+            print(f"    {m['rationale']}")
+        print()
+
     print("TOP DOMAINS")
     print("-" * 80)
     all_domains = results["domains"]
@@ -998,6 +1075,8 @@ def main():
 
     iocs = extract_iocs(results)
     results["iocs"] = iocs
+
+    results["mitre_attack"] = map_mitre_attack(results)
 
     custody = build_chain_of_custody(args.har_file, args.analyst, args.case_id)
     results["chain_of_custody"] = custody
