@@ -15,6 +15,7 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 SUSPICIOUS_CRED_KEYS = {
@@ -71,6 +72,79 @@ TRACKER_HINTS = [
     "doubleclick", "google-analytics", "googletagmanager", "segment",
     "hotjar", "facebook", "meta", "tiktok", "bing"
 ]
+
+
+def parse_har_timestamp(ts_str: str):
+    """Parse HAR startedDateTime to a UTC-aware datetime. Returns None on failure."""
+    if not ts_str:
+        return None
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+    ):
+        try:
+            dt = datetime.strptime(ts_str, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return None
+
+
+def build_timeline(entries, suspicious_indices: set) -> list:
+    """
+    Build a chronological event timeline from HAR entries.
+    Each event includes the timestamp, method, status, URL, and whether
+    it is flagged as suspicious. Time deltas between consecutive suspicious
+    events are computed to surface rapid credential-capture sequences.
+    """
+    events = []
+    prev_suspicious_dt = None
+
+    for idx, entry in enumerate(entries, start=1):
+        ts_str = entry.get("startedDateTime", "")
+        dt = parse_har_timestamp(ts_str)
+        request = entry.get("request", {})
+        response = entry.get("response", {})
+        url = request.get("url", "")
+        method = str(request.get("method", "")).upper()
+        status = int(response.get("status", 0) or 0)
+        is_suspicious = idx in suspicious_indices
+
+        delta_ms = None
+        if is_suspicious and dt and prev_suspicious_dt:
+            delta_ms = int((dt - prev_suspicious_dt).total_seconds() * 1000)
+        if is_suspicious and dt:
+            prev_suspicious_dt = dt
+
+        events.append({
+            "index": idx,
+            "timestamp": ts_str,
+            "method": method,
+            "status": status,
+            "url": url,
+            "is_suspicious": is_suspicious,
+            "delta_ms_since_prev_suspicious": delta_ms,
+        })
+
+    return events
+
+
+def flag_rapid_sequences(timeline: list, threshold_ms: int = 3000) -> list:
+    """
+    Return timeline events where a suspicious request follows a prior
+    suspicious request within threshold_ms — indicative of automated
+    credential capture or token relay.
+    """
+    return [
+        e for e in timeline
+        if e["is_suspicious"]
+        and e["delta_ms_since_prev_suspicious"] is not None
+        and e["delta_ms_since_prev_suspicious"] <= threshold_ms
+    ]
 
 
 def safe_get(dct, *keys, default=None):
@@ -363,9 +437,13 @@ def analyze_har(har):
                         "matches": sorted(set(hits)),
                     })
 
+    # Timeline reconstruction
+    suspicious_indices = {r["index"] for r in suspicious_requests}
+    timeline = build_timeline(entries, suspicious_indices)
+    rapid_sequences = flag_rapid_sequences(timeline)
+
     # Reverse-proxy phishing heuristics
     reverse_proxy_indicators = []
-    auth_domains = {item["url"] for item in auth_related}
     suspicious_auth_posts = [
         r for r in suspicious_requests
         if r["method"] == "POST" and (
@@ -429,6 +507,7 @@ def analyze_har(har):
             "total_js_hits": len(js_hits),
             "total_cookies_seen": len(cookies_seen),
             "total_exfil_findings": len(exfil_findings),
+            "total_rapid_sequences": len(rapid_sequences),
         },
         "assessment": assessment,
         "domains": all_domains.most_common(),
@@ -442,6 +521,8 @@ def analyze_har(har):
         "reverse_proxy_indicators": reverse_proxy_indicators,
         "exfil_findings": exfil_findings,
         "content_types": content_types.most_common(),
+        "timeline": timeline,
+        "rapid_sequences": rapid_sequences,
     }
 
 
@@ -460,6 +541,7 @@ def print_report(results):
     print(f"Suspicious JS responses:      {s['total_js_hits']}")
     print(f"Cookies observed:             {s['total_cookies_seen']}")
     print(f"Exfil findings:               {s['total_exfil_findings']}")
+    print(f"Rapid suspicious sequences:   {s['total_rapid_sequences']}")
     print()
 
     print("ASSESSMENT")
@@ -473,6 +555,40 @@ def print_report(results):
     for domain, count in results["domains"][:20]:
         print(f"{domain:<50} {count}")
     print()
+
+    if results["rapid_sequences"]:
+        print("RAPID SUSPICIOUS SEQUENCES  (suspicious events <= 3s apart)")
+        print("-" * 80)
+        print("  These events follow a prior suspicious request within 3 seconds,")
+        print("  suggesting automated credential capture or token relay.\n")
+        for e in results["rapid_sequences"][:20]:
+            delta = f"+{e['delta_ms_since_prev_suspicious']}ms"
+            print(f"  [#{e['index']}] {delta:<10} {e['method']} {e['status']} {e['url']}")
+        total = len(results["rapid_sequences"])
+        if total > 20:
+            print(f"  ... {total - 20} more (use --json for full output)")
+        print()
+
+    if results["timeline"]:
+        tl = results["timeline"]
+        # Show only entries with a timestamp; fall back to showing suspicious ones
+        timestamped = [e for e in tl if e["timestamp"]]
+        suspicious_tl = [e for e in tl if e["is_suspicious"]]
+        if timestamped:
+            print("SUSPICIOUS EVENT TIMELINE")
+            print("-" * 80)
+            shown = suspicious_tl[:30]
+            for e in shown:
+                ts = e["timestamp"][:23] if e["timestamp"] else "no-timestamp"
+                delta = (
+                    f"  (+{e['delta_ms_since_prev_suspicious']}ms)"
+                    if e["delta_ms_since_prev_suspicious"] is not None
+                    else ""
+                )
+                print(f"  {ts}  [#{e['index']:>4}] {e['method']:<7} {e['status']}  {e['url'][:70]}{delta}")
+            if len(suspicious_tl) > 30:
+                print(f"  ... {len(suspicious_tl) - 30} more suspicious events (use --json for full timeline)")
+            print()
 
     if results["tracker_domains"]:
         print("TRACKER / AD-LIKE DOMAINS")
