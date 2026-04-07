@@ -87,6 +87,32 @@ python3 har_analyzer.py session1.har session2.har session3.har --analyst "Analys
 python3 har_analyzer.py *.har --iocs-only
 ```
 
+### Network troubleshooting mode
+
+Captures a HAR file while experiencing platform issues (e.g. a buggy page in Google SecOps) and produces an engineer-friendly report covering latency breakdowns, errors, CORS failures, and slow requests.
+
+```bash
+python3 har_analyzer.py session.har --network
+```
+
+With a custom slow-request threshold (default is 3000ms):
+
+```bash
+python3 har_analyzer.py session.har --network --slow-threshold 2000
+```
+
+As JSON for ticket attachments or further processing:
+
+```bash
+python3 har_analyzer.py session.har --network --json
+```
+
+Batch across multiple sessions:
+
+```bash
+python3 har_analyzer.py session1.har session2.har --network
+```
+
 ### All options
 
 ```
@@ -95,6 +121,8 @@ positional arguments:
 
 options:
   --json                Output results as JSON
+  --network             Run network troubleshooting analysis instead of security analysis
+  --slow-threshold MS   Slow request threshold in ms for --network mode (default: 3000)
   --iocs-only           Output deduplicated IOC list only (domains, IPs, URLs, cookies)
   --analyst ANALYST     Analyst name for chain-of-custody metadata
   --case-id CASE_ID     Case/ticket ID for chain-of-custody metadata
@@ -103,6 +131,8 @@ options:
 ---
 
 ## Output Sections
+
+### Security Analysis (`default`)
 
 | Section | Description |
 |---|---|
@@ -127,6 +157,21 @@ options:
 | Auth-Related Requests | All requests to auth/SSO endpoints |
 | IOC Summary | Deduplicated domains, IPs, URLs, and cookie names for threat intel use |
 | Content Types | Frequency breakdown of all response MIME types |
+
+### Network Troubleshooting (`--network`)
+
+| Section | Description |
+|---|---|
+| Session Overview | Total requests, bytes transferred, session duration, error and failure counts |
+| Latency Percentiles | p50 / p95 / p99 / mean for TTFB and total request time across all requests |
+| Slow Requests | Requests exceeding the threshold, with per-phase timing (DNS / Connect / SSL / TTFB / Transfer) and a root-cause hint |
+| HTTP Error Responses | All 4xx and 5xx responses grouped by status code with URLs |
+| Failed / Blocked Requests | Status 0 responses — connection refused, timeouts, SSL failures |
+| CORS Issues | Failed OPTIONS preflights and responses missing `Access-Control-Allow-Origin` |
+| Large Responses | Responses exceeding 5 MB that may be contributing to page slowness |
+| Redirect Chains | Multi-hop redirect sequences with accumulated latency |
+| Per-Domain Latency Summary | Mean, max, and total time per domain — quickly identifies slow third-party dependencies |
+| Transfer Breakdown by Content Type | Total MB and request count per MIME type |
 
 ---
 

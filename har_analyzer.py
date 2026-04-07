@@ -1126,16 +1126,501 @@ def print_report(results):
         print(f"  ... showing 15 of {len(cts)} content types (use --json for full list)")
 
 
-def process_har_file(har_path: str, analyst: str, case_id: str) -> dict:
-    """Load, analyze, and enrich a single HAR file. Returns the full results dict."""
+# ---------------------------------------------------------------------------
+# Network Troubleshooting Analysis
+# ---------------------------------------------------------------------------
+
+# Thresholds (milliseconds) for slow-phase classification
+SLOW_REQUEST_THRESHOLD_MS = 3000   # total time before a request is flagged slow
+SLOW_TTFB_THRESHOLD_MS = 2000      # TTFB alone — indicates server-side latency
+SLOW_DNS_THRESHOLD_MS = 500        # unusually slow DNS resolution
+SLOW_SSL_THRESHOLD_MS = 1000       # unusually slow TLS handshake
+LARGE_RESPONSE_THRESHOLD_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _safe_timing(timings: dict, key: str) -> float:
+    """Return a timing value >= 0, treating -1 (not applicable) as 0."""
+    val = timings.get(key, 0) or 0
+    return max(float(val), 0.0)
+
+
+def _percentile(sorted_values: list, pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    idx = int(len(sorted_values) * pct / 100)
+    idx = min(idx, len(sorted_values) - 1)
+    return sorted_values[idx]
+
+
+def analyze_network(har: dict, slow_threshold_ms: int = SLOW_REQUEST_THRESHOLD_MS) -> dict:
+    """
+    Analyze a HAR file for network performance and reliability issues.
+    Returns a structured report suitable for sharing with platform engineers.
+
+    Covers:
+    - Session overview (total requests, bytes, duration, error counts)
+    - Slow requests with per-phase timing breakdown and root-cause hint
+    - p50 / p95 / p99 TTFB across all requests
+    - HTTP error responses (4xx / 5xx) grouped by status code
+    - Failed / blocked requests (status 0, net::ERR_*)
+    - CORS failures (failed OPTIONS preflights, missing ACAO headers)
+    - Largest responses by body size
+    - Redirect chains and the latency they add
+    - Per-content-type transfer breakdown
+    - Per-domain latency summary
+    """
+    entries = safe_get(har, "log", "entries", default=[])
+    if not isinstance(entries, list):
+        raise ValueError("Invalid HAR: log.entries missing or malformed")
+
+    # ---- per-entry pass ------------------------------------------------
+    slow_requests = []
+    error_responses = []       # 4xx / 5xx
+    failed_requests = []       # status 0 or net::ERR_*
+    cors_issues = []
+    large_responses = []
+    redirects_net = []         # redirects seen from a perf perspective
+    all_ttfb = []
+    all_total_ms = []
+    domain_timings: defaultdict = defaultdict(list)
+    content_type_bytes: Counter = Counter()
+    content_type_count: Counter = Counter()
+    total_bytes = 0
+    first_dt = None
+    last_dt = None
+
+    for idx, entry in enumerate(entries, start=1):
+        request = entry.get("request", {})
+        response = entry.get("response", {})
+        timings = entry.get("timings", {}) or {}
+        content = response.get("content", {}) or {}
+
+        url = request.get("url", "")
+        method = str(request.get("method", "")).upper()
+        status = int(response.get("status", 0) or 0)
+        domain = get_domain(url)
+        mime = str(content.get("mimeType", "")).lower().split(";")[0].strip()
+
+        # Timestamps for session duration
+        ts_str = entry.get("startedDateTime", "")
+        dt = parse_har_timestamp(ts_str)
+        if dt:
+            if first_dt is None or dt < first_dt:
+                first_dt = dt
+            if last_dt is None or dt > last_dt:
+                last_dt = dt
+
+        # Timing phases
+        dns_ms = _safe_timing(timings, "dns")
+        connect_ms = _safe_timing(timings, "connect")
+        ssl_ms = _safe_timing(timings, "ssl")
+        send_ms = _safe_timing(timings, "send")
+        wait_ms = _safe_timing(timings, "wait")       # TTFB
+        receive_ms = _safe_timing(timings, "receive")
+        blocked_ms = _safe_timing(timings, "blocked")
+
+        total_ms = dns_ms + connect_ms + ssl_ms + send_ms + wait_ms + receive_ms + blocked_ms
+        # HAR spec also exposes time at the top level as the authoritative total
+        har_total = entry.get("time")
+        if har_total is not None and float(har_total) > 0:
+            total_ms = float(har_total)
+
+        # Response size
+        body_size = response.get("bodySize", 0) or 0
+        content_size = content.get("size", 0) or 0
+        resp_bytes = max(int(body_size), int(content_size))
+        total_bytes += resp_bytes
+
+        if mime:
+            content_type_bytes[mime] += resp_bytes
+            content_type_count[mime] += 1
+
+        # TTFB collection for percentile stats
+        if wait_ms > 0:
+            all_ttfb.append(wait_ms)
+        if total_ms > 0:
+            all_total_ms.append(total_ms)
+            if domain:
+                domain_timings[domain].append(total_ms)
+
+        # ---- Slow requests ----
+        if total_ms >= slow_threshold_ms:
+            phases = {
+                "dns_ms": round(dns_ms),
+                "connect_ms": round(connect_ms),
+                "ssl_ms": round(ssl_ms),
+                "send_ms": round(send_ms),
+                "ttfb_ms": round(wait_ms),
+                "receive_ms": round(receive_ms),
+                "blocked_ms": round(blocked_ms),
+                "total_ms": round(total_ms),
+            }
+            # Root-cause hint: which phase dominates?
+            dominant = max(phases, key=phases.get)
+            hints = {
+                "ttfb_ms": "High TTFB — likely server-side processing latency",
+                "receive_ms": "Slow transfer — large response or bandwidth-limited",
+                "dns_ms": "Slow DNS resolution — check resolver or TTL",
+                "ssl_ms": "Slow TLS handshake — check cert chain or OCSP",
+                "connect_ms": "Slow TCP connect — network path or firewall latency",
+                "blocked_ms": "Request queued/blocked — browser connection pool or proxy",
+                "send_ms": "Slow request upload — large POST body or bandwidth-limited",
+            }
+            slow_requests.append({
+                "index": idx,
+                "method": method,
+                "status": status,
+                "url": url,
+                "domain": domain,
+                "phases": phases,
+                "dominant_phase": dominant,
+                "hint": hints.get(dominant, ""),
+                "timestamp": ts_str,
+            })
+
+        # ---- HTTP errors ----
+        if 400 <= status <= 599:
+            error_responses.append({
+                "index": idx,
+                "method": method,
+                "status": status,
+                "url": url,
+                "domain": domain,
+                "total_ms": round(total_ms),
+            })
+
+        # ---- Failed / blocked ----
+        if status == 0:
+            error_text = safe_get(response, "content", "text", default="") or ""
+            failed_requests.append({
+                "index": idx,
+                "method": method,
+                "url": url,
+                "domain": domain,
+                "error": error_text[:200] if error_text else "No response (connection failed, timed out, or blocked)",
+            })
+
+        # ---- CORS issues ----
+        response_headers = normalize_headers(response.get("headers", []))
+        request_headers = normalize_headers(request.get("headers", []))
+
+        if method == "OPTIONS":
+            acao = response_headers.get("access-control-allow-origin", [])
+            if status >= 400 or not acao:
+                cors_issues.append({
+                    "index": idx,
+                    "type": "Failed OPTIONS preflight",
+                    "status": status,
+                    "url": url,
+                    "detail": f"Preflight returned {status} with no Access-Control-Allow-Origin header" if not acao
+                              else f"Preflight returned {status}",
+                })
+        else:
+            origin_header = request_headers.get("origin", [])
+            if origin_header:
+                acao = response_headers.get("access-control-allow-origin", [])
+                if not acao:
+                    cors_issues.append({
+                        "index": idx,
+                        "type": "Missing Access-Control-Allow-Origin",
+                        "status": status,
+                        "url": url,
+                        "detail": f"Request sent Origin: {origin_header[0]} but response has no ACAO header",
+                    })
+
+        # ---- Large responses ----
+        if resp_bytes >= LARGE_RESPONSE_THRESHOLD_BYTES:
+            large_responses.append({
+                "index": idx,
+                "method": method,
+                "status": status,
+                "url": url,
+                "domain": domain,
+                "size_mb": round(resp_bytes / (1024 * 1024), 2),
+                "mime": mime,
+                "total_ms": round(total_ms),
+            })
+
+        # ---- Redirect overhead ----
+        if status in {301, 302, 303, 307, 308}:
+            location = response_headers.get("location", [""])[0]
+            redirects_net.append({
+                "index": idx,
+                "status": status,
+                "from_url": url,
+                "to_url": location,
+                "total_ms": round(total_ms),
+            })
+
+    # ---- Aggregates ----
+    all_ttfb_sorted = sorted(all_ttfb)
+    all_total_sorted = sorted(all_total_ms)
+
+    ttfb_stats = {
+        "p50_ms": round(_percentile(all_ttfb_sorted, 50)),
+        "p95_ms": round(_percentile(all_ttfb_sorted, 95)),
+        "p99_ms": round(_percentile(all_ttfb_sorted, 99)),
+        "mean_ms": round(sum(all_ttfb_sorted) / len(all_ttfb_sorted)) if all_ttfb_sorted else 0,
+    }
+
+    total_ms_stats = {
+        "p50_ms": round(_percentile(all_total_sorted, 50)),
+        "p95_ms": round(_percentile(all_total_sorted, 95)),
+        "p99_ms": round(_percentile(all_total_sorted, 99)),
+        "mean_ms": round(sum(all_total_sorted) / len(all_total_sorted)) if all_total_sorted else 0,
+    }
+
+    session_duration_ms = None
+    if first_dt and last_dt:
+        session_duration_ms = round((last_dt - first_dt).total_seconds() * 1000)
+
+    # Per-domain summary: mean and max total time
+    domain_summary = []
+    for dom, times in sorted(domain_timings.items(), key=lambda x: -sum(x[1])):
+        domain_summary.append({
+            "domain": dom,
+            "request_count": len(times),
+            "mean_ms": round(sum(times) / len(times)),
+            "max_ms": round(max(times)),
+            "total_ms": round(sum(times)),
+        })
+
+    # Error breakdown by status code
+    error_by_status: Counter = Counter(r["status"] for r in error_responses)
+
+    # Group redirect chains (follow from_url -> to_url links)
+    redirect_chains = _build_redirect_chains(redirects_net)
+
+    return {
+        "session": {
+            "har_file": safe_get(har, "log", "creator", "name", default="unknown"),
+            "total_requests": len(entries),
+            "total_bytes": total_bytes,
+            "total_mb": round(total_bytes / (1024 * 1024), 2),
+            "session_duration_ms": session_duration_ms,
+            "session_start": first_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if first_dt else None,
+            "error_5xx_count": sum(v for k, v in error_by_status.items() if k >= 500),
+            "error_4xx_count": sum(v for k, v in error_by_status.items() if 400 <= k < 500),
+            "failed_count": len(failed_requests),
+            "slow_count": len(slow_requests),
+            "cors_issue_count": len(cors_issues),
+            "redirect_count": len(redirects_net),
+        },
+        "ttfb_stats": ttfb_stats,
+        "total_time_stats": total_ms_stats,
+        "slow_requests": sorted(slow_requests, key=lambda x: -x["phases"]["total_ms"]),
+        "error_responses": error_responses,
+        "error_by_status": dict(error_by_status.most_common()),
+        "failed_requests": failed_requests,
+        "cors_issues": cors_issues,
+        "large_responses": sorted(large_responses, key=lambda x: -x["size_mb"]),
+        "redirects": redirects_net,
+        "redirect_chains": redirect_chains,
+        "domain_summary": domain_summary[:30],
+        "content_type_breakdown": [
+            {"mime": k, "count": content_type_count[k], "total_mb": round(content_type_bytes[k] / (1024 * 1024), 3)}
+            for k, _ in content_type_bytes.most_common(20)
+        ],
+    }
+
+
+def _build_redirect_chains(redirects: list) -> list:
+    """
+    Stitch individual redirect hops into chains.
+    Returns a list of chains, each chain being an ordered list of hops
+    with the total accumulated latency.
+    """
+    # Map from_url -> hop
+    by_from = {r["from_url"]: r for r in redirects}
+    visited = set()
+    chains = []
+
+    for r in redirects:
+        if r["from_url"] in visited:
+            continue
+        # Walk back to find chain start (no other redirect points to this URL)
+        to_urls = {x["to_url"] for x in redirects}
+        if r["from_url"] in to_urls:
+            continue  # this is a middle/end hop; start from head
+
+        chain = []
+        current = r
+        while current and current["from_url"] not in visited:
+            chain.append(current)
+            visited.add(current["from_url"])
+            current = by_from.get(current["to_url"])
+
+        if len(chain) >= 2:
+            chains.append({
+                "hops": chain,
+                "total_ms": sum(h["total_ms"] for h in chain),
+                "length": len(chain),
+            })
+
+    return sorted(chains, key=lambda x: -x["total_ms"])
+
+
+def print_network_report(net: dict, slow_threshold_ms: int = SLOW_REQUEST_THRESHOLD_MS) -> None:
+    """Print an engineer-friendly network troubleshooting report."""
+    s = net["session"]
+
+    def mb(b):
+        return f"{b:.2f} MB"
+
+    print("=" * 80)
+    print("HAR ANALYZER — NETWORK TROUBLESHOOTING REPORT")
+    print("=" * 80)
+
+    # Session overview
+    duration_str = f"{s['session_duration_ms'] / 1000:.1f}s" if s["session_duration_ms"] else "unknown"
+    print(f"  Session start:     {s['session_start'] or 'unknown'}")
+    print(f"  Duration:          {duration_str}")
+    print(f"  Total requests:    {s['total_requests']}")
+    print(f"  Total transferred: {mb(s['total_mb'])}")
+    print(f"  Slow (>{slow_threshold_ms}ms):     {s['slow_count']}")
+    print(f"  Errors (5xx):      {s['error_5xx_count']}")
+    print(f"  Errors (4xx):      {s['error_4xx_count']}")
+    print(f"  Failed/blocked:    {s['failed_count']}")
+    print(f"  CORS issues:       {s['cors_issue_count']}")
+    print(f"  Redirects:         {s['redirect_count']}")
+    print()
+
+    # TTFB percentiles
+    t = net["ttfb_stats"]
+    r = net["total_time_stats"]
+    print("LATENCY PERCENTILES")
+    print("-" * 80)
+    print(f"  {'Metric':<30} {'p50':>8}  {'p95':>8}  {'p99':>8}  {'mean':>8}")
+    print(f"  {'TTFB (server response time)':<30} {t['p50_ms']:>7}ms  {t['p95_ms']:>7}ms  {t['p99_ms']:>7}ms  {t['mean_ms']:>7}ms")
+    print(f"  {'Total request time':<30} {r['p50_ms']:>7}ms  {r['p95_ms']:>7}ms  {r['p99_ms']:>7}ms  {r['mean_ms']:>7}ms")
+    print()
+
+    # Slow requests
+    if net["slow_requests"]:
+        slow = net["slow_requests"]
+        print(f"SLOW REQUESTS  (>{slow_threshold_ms}ms total)  —  sorted by total time descending")
+        print("-" * 80)
+        for req in slow[:20]:
+            p = req["phases"]
+            print(f"  [#{req['index']}]  {p['total_ms']}ms  {req['method']} {req['status']}  {req['url']}")
+            print(f"    DNS:{p['dns_ms']}ms  Connect:{p['connect_ms']}ms  SSL:{p['ssl_ms']}ms  "
+                  f"TTFB:{p['ttfb_ms']}ms  Transfer:{p['receive_ms']}ms  Blocked:{p['blocked_ms']}ms")
+            if req["hint"]:
+                print(f"    >> {req['hint']}")
+        if len(slow) > 20:
+            print(f"  ... showing 20 of {len(slow)} slow requests (use --json for full list)")
+        print()
+
+    # HTTP errors
+    if net["error_responses"]:
+        errs = net["error_responses"]
+        print("HTTP ERROR RESPONSES")
+        print("-" * 80)
+        if net["error_by_status"]:
+            breakdown = "  ".join(f"{code}: {cnt}" for code, cnt in net["error_by_status"].items())
+            print(f"  Status breakdown:  {breakdown}\n")
+        for e in errs[:25]:
+            print(f"  [#{e['index']}]  {e['status']}  {e['method']}  {e['url']}")
+        if len(errs) > 25:
+            print(f"  ... showing 25 of {len(errs)} errors (use --json for full list)")
+        print()
+
+    # Failed / blocked requests
+    if net["failed_requests"]:
+        failed = net["failed_requests"]
+        print("FAILED / BLOCKED REQUESTS")
+        print("-" * 80)
+        for f in failed[:20]:
+            print(f"  [#{f['index']}]  {f['method']}  {f['url']}")
+            print(f"    {f['error']}")
+        if len(failed) > 20:
+            print(f"  ... showing 20 of {len(failed)} failed requests (use --json for full list)")
+        print()
+
+    # CORS issues
+    if net["cors_issues"]:
+        cors = net["cors_issues"]
+        print("CORS ISSUES")
+        print("-" * 80)
+        for c in cors[:20]:
+            print(f"  [#{c['index']}]  [{c['type']}]  {c['status']}  {c['url']}")
+            print(f"    {c['detail']}")
+        if len(cors) > 20:
+            print(f"  ... showing 20 of {len(cors)} CORS issues (use --json for full list)")
+        print()
+
+    # Large responses
+    if net["large_responses"]:
+        large = net["large_responses"]
+        print(f"LARGE RESPONSES  (>{LARGE_RESPONSE_THRESHOLD_BYTES // (1024*1024)} MB)")
+        print("-" * 80)
+        for lr in large[:10]:
+            print(f"  [#{lr['index']}]  {lr['size_mb']} MB  {lr['mime']}  {lr['total_ms']}ms  {lr['url']}")
+        if len(large) > 10:
+            print(f"  ... showing 10 of {len(large)} large responses (use --json for full list)")
+        print()
+
+    # Redirect chains
+    if net["redirect_chains"]:
+        chains = net["redirect_chains"]
+        print("REDIRECT CHAINS  (multi-hop redirect sequences)")
+        print("-" * 80)
+        for chain in chains[:10]:
+            print(f"  Chain ({chain['length']} hops, {chain['total_ms']}ms total):")
+            for hop in chain["hops"]:
+                print(f"    {hop['status']}  {hop['from_url']}")
+                print(f"      --> {hop['to_url']}  ({hop['total_ms']}ms)")
+        if len(chains) > 10:
+            print(f"  ... showing 10 of {len(chains)} chains (use --json for full list)")
+        print()
+    elif net["redirects"]:
+        redir = net["redirects"]
+        print("REDIRECTS  (single hops)")
+        print("-" * 80)
+        for r in redir[:20]:
+            print(f"  [#{r['index']}]  {r['status']}  {r['total_ms']}ms  {r['from_url']}  -->  {r['to_url']}")
+        if len(redir) > 20:
+            print(f"  ... showing 20 of {len(redir)} redirects (use --json for full list)")
+        print()
+
+    # Per-domain latency summary
+    if net["domain_summary"]:
+        print("PER-DOMAIN LATENCY SUMMARY")
+        print("-" * 80)
+        print(f"  {'Domain':<50} {'Reqs':>5}  {'Mean':>8}  {'Max':>8}  {'Total':>10}")
+        for d in net["domain_summary"][:20]:
+            print(f"  {d['domain']:<50} {d['request_count']:>5}  {d['mean_ms']:>7}ms  {d['max_ms']:>7}ms  {d['total_ms']:>9}ms")
+        if len(net["domain_summary"]) > 20:
+            print(f"  ... showing 20 of {len(net['domain_summary'])} domains (use --json for full list)")
+        print()
+
+    # Content type transfer breakdown
+    if net["content_type_breakdown"]:
+        print("TRANSFER BREAKDOWN BY CONTENT TYPE")
+        print("-" * 80)
+        print(f"  {'Content Type':<45} {'Requests':>8}  {'MB transferred':>15}")
+        for ct in net["content_type_breakdown"]:
+            print(f"  {ct['mime']:<45} {ct['count']:>8}  {ct['total_mb']:>14.3f}")
+        print()
+
+
+def _load_har(har_path: str):
+    """Load and parse a HAR file. Returns the parsed dict or None on error."""
     try:
         with open(har_path, "r", encoding="utf-8") as f:
-            har = json.load(f)
+            return json.load(f)
     except FileNotFoundError:
         print(f"Error: file not found: {har_path}", file=sys.stderr)
         return None
     except json.JSONDecodeError as e:
         print(f"Error: invalid JSON in {har_path}: {e}", file=sys.stderr)
+        return None
+
+
+def process_har_file(har_path: str, analyst: str, case_id: str) -> dict:
+    """Load, analyze, and enrich a single HAR file for security analysis."""
+    har = _load_har(har_path)
+    if har is None:
         return None
 
     try:
@@ -1150,15 +1635,64 @@ def process_har_file(har_path: str, analyst: str, case_id: str) -> dict:
     return results
 
 
+def process_har_file_network(har_path: str, slow_threshold_ms: int) -> dict:
+    """Load and run network troubleshooting analysis on a single HAR file."""
+    har = _load_har(har_path)
+    if har is None:
+        return None
+
+    try:
+        return analyze_network(har, slow_threshold_ms=slow_threshold_ms)
+    except Exception as e:
+        print(f"Error analyzing {har_path}: {e}", file=sys.stderr)
+        return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Advanced HAR analyzer for phishing/token theft investigations")
-    parser.add_argument("har_files", nargs="+", help="Path(s) to HAR file(s) — accepts multiple files for batch analysis")
+    parser = argparse.ArgumentParser(
+        description="HAR file analyzer — security investigation and network troubleshooting",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  Security analysis (default):\n"
+            "    python3 har_analyzer.py suspicious.har --analyst 'Analyst Name' --case-id INC-001\n\n"
+            "  Network troubleshooting:\n"
+            "    python3 har_analyzer.py session.har --network\n"
+            "    python3 har_analyzer.py session.har --network --slow-threshold 2000\n\n"
+            "  IOC extraction:\n"
+            "    python3 har_analyzer.py suspicious.har --iocs-only\n\n"
+            "  Batch mode:\n"
+            "    python3 har_analyzer.py *.har --network\n"
+        ),
+    )
+    parser.add_argument("har_files", nargs="+", help="Path(s) to HAR file(s)")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
-    parser.add_argument("--iocs-only", action="store_true", help="Output deduplicated IOC list only (domains, IPs, URLs, cookies)")
+    parser.add_argument("--network", action="store_true",
+                        help="Run network troubleshooting analysis instead of security analysis")
+    parser.add_argument("--slow-threshold", type=int, default=SLOW_REQUEST_THRESHOLD_MS, metavar="MS",
+                        help=f"Slow request threshold in milliseconds for --network mode (default: {SLOW_REQUEST_THRESHOLD_MS})")
+    parser.add_argument("--iocs-only", action="store_true",
+                        help="Output deduplicated IOC list only (domains, IPs, URLs, cookies)")
     parser.add_argument("--analyst", default="", help="Analyst name for chain-of-custody metadata")
     parser.add_argument("--case-id", default="", help="Case/ticket ID for chain-of-custody metadata")
     args = parser.parse_args()
 
+    # ---- Network troubleshooting mode ----
+    if args.network:
+        for har_path in args.har_files:
+            net = process_har_file_network(har_path, args.slow_threshold)
+            if not net:
+                continue
+            if len(args.har_files) > 1:
+                print("\n" + "=" * 80)
+                print(f"FILE: {har_path}")
+            if args.json:
+                print(json.dumps(net, indent=2))
+            else:
+                print_network_report(net, slow_threshold_ms=args.slow_threshold)
+        return
+
+    # ---- Security analysis mode ----
     all_results = []
     for har_path in args.har_files:
         results = process_har_file(har_path, args.analyst, args.case_id)
@@ -1169,7 +1703,6 @@ def main():
         sys.exit(1)
 
     if args.iocs_only:
-        # Merge IOCs across all files and deduplicate
         merged_domains: set = set()
         merged_ips: set = set()
         merged_urls: set = set()
