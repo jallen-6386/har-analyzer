@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import re
@@ -341,6 +342,24 @@ def score_request(entry):
     return score, reasons, post_info
 
 
+def build_chain_of_custody(har_path: str, analyst: str, case_id: str) -> dict:
+    """
+    Compute evidence integrity metadata for the analyzed HAR file.
+    SHA-256 hash ensures the file has not been modified since analysis.
+    """
+    sha256 = hashlib.sha256()
+    with open(har_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha256.update(chunk)
+    return {
+        "har_file": har_path,
+        "sha256": sha256.hexdigest(),
+        "analyzed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "analyst": analyst or "not specified",
+        "case_id": case_id or "not specified",
+    }
+
+
 def extract_iocs(results: dict) -> dict:
     """
     Deduplicate and categorize Indicators of Compromise from analysis results.
@@ -610,6 +629,17 @@ def print_report(results):
     print("=" * 80)
     print("ADVANCED HAR ANALYZER REPORT")
     print("=" * 80)
+    coc = results.get("chain_of_custody", {})
+    if coc:
+        print("CHAIN OF CUSTODY")
+        print("-" * 80)
+        print(f"  File:         {coc.get('har_file', 'unknown')}")
+        print(f"  SHA-256:      {coc.get('sha256', 'unknown')}")
+        print(f"  Analyzed:     {coc.get('analyzed_at_utc', 'unknown')}")
+        print(f"  Analyst:      {coc.get('analyst', 'not specified')}")
+        print(f"  Case ID:      {coc.get('case_id', 'not specified')}")
+        print()
+
     print(f"Total entries:                 {s['total_entries']}")
     print(f"Unique domains:               {s['unique_domains']}")
     print(f"Top-level domain:             {s['top_level_domain']}")
@@ -793,6 +823,8 @@ def main():
     parser.add_argument("har_file", help="Path to HAR file")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--iocs-only", action="store_true", help="Output deduplicated IOC list only (domains, IPs, URLs, cookies)")
+    parser.add_argument("--analyst", default="", help="Analyst name for chain-of-custody metadata")
+    parser.add_argument("--case-id", default="", help="Case/ticket ID for chain-of-custody metadata")
     args = parser.parse_args()
 
     try:
@@ -813,6 +845,9 @@ def main():
 
     iocs = extract_iocs(results)
     results["iocs"] = iocs
+
+    custody = build_chain_of_custody(args.har_file, args.analyst, args.case_id)
+    results["chain_of_custody"] = custody
 
     if args.iocs_only:
         print("# SUSPICIOUS DOMAINS")
