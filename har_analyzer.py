@@ -325,6 +325,18 @@ def score_request(entry):
         score += 1
         reasons.append("Domain suggests auth/SSO activity")
 
+    # Cross-origin POST: credentials/tokens sent to a different domain than the page origin
+    if method == "POST" and (cred_hits or token_hits):
+        referer_vals = headers.get("referer", [])
+        if referer_vals:
+            referer_domain = get_domain(referer_vals[0])
+            if referer_domain and referer_domain != domain:
+                score += 6
+                reasons.append(
+                    f"CROSS-ORIGIN POST: credentials/tokens submitted to '{domain}' "
+                    f"but Referer origin is '{referer_domain}' — primary phishing exfil indicator"
+                )
+
     return score, reasons, post_info
 
 
@@ -437,6 +449,12 @@ def analyze_har(har):
                         "matches": sorted(set(hits)),
                     })
 
+    # Cross-origin POST findings (extracted from scored suspicious requests)
+    cross_origin_posts = [
+        r for r in suspicious_requests
+        if any("CROSS-ORIGIN POST" in reason for reason in r["reasons"])
+    ]
+
     # Timeline reconstruction
     suspicious_indices = {r["index"] for r in suspicious_requests}
     timeline = build_timeline(entries, suspicious_indices)
@@ -485,6 +503,11 @@ def analyze_har(har):
 
     # High-level assessment
     assessment = []
+    if cross_origin_posts:
+        assessment.append(
+            f"CRITICAL: {len(cross_origin_posts)} cross-origin credential/token POST(s) detected — "
+            "primary phishing exfil indicator"
+        )
     if exfil_findings:
         assessment.append("Potential data exfiltration present in request bodies")
     if reverse_proxy_indicators:
@@ -508,6 +531,7 @@ def analyze_har(har):
             "total_cookies_seen": len(cookies_seen),
             "total_exfil_findings": len(exfil_findings),
             "total_rapid_sequences": len(rapid_sequences),
+            "total_cross_origin_posts": len(cross_origin_posts),
         },
         "assessment": assessment,
         "domains": all_domains.most_common(),
@@ -523,6 +547,7 @@ def analyze_har(har):
         "content_types": content_types.most_common(),
         "timeline": timeline,
         "rapid_sequences": rapid_sequences,
+        "cross_origin_posts": cross_origin_posts,
     }
 
 
@@ -542,6 +567,7 @@ def print_report(results):
     print(f"Cookies observed:             {s['total_cookies_seen']}")
     print(f"Exfil findings:               {s['total_exfil_findings']}")
     print(f"Rapid suspicious sequences:   {s['total_rapid_sequences']}")
+    print(f"Cross-origin POSTs:           {s['total_cross_origin_posts']}")
     print()
 
     print("ASSESSMENT")
@@ -555,6 +581,24 @@ def print_report(results):
     for domain, count in results["domains"][:20]:
         print(f"{domain:<50} {count}")
     print()
+
+    if results["cross_origin_posts"]:
+        print("*** CROSS-ORIGIN CREDENTIAL/TOKEN POST — PRIMARY PHISHING EXFIL INDICATOR ***")
+        print("-" * 80)
+        print("  Credentials or tokens were POSTed to a domain different from the page origin.")
+        print("  This is the primary indicator of a reverse-proxy phishing kit.\n")
+        for req in results["cross_origin_posts"]:
+            print(f"  [#{req['index']}] Score={req['score']}  {req['method']} {req['status']}  {req['url']}")
+            for reason in req["reasons"]:
+                if "CROSS-ORIGIN" in reason:
+                    print(f"    !! {reason}")
+            if req["parsed_fields"]:
+                fields_preview = ", ".join(list(req["parsed_fields"].keys())[:8])
+                print(f"    Fields: {fields_preview}")
+        total = len(results["cross_origin_posts"])
+        if total > 20:
+            print(f"  ... {total - 20} more (use --json for full output)")
+        print()
 
     if results["rapid_sequences"]:
         print("RAPID SUSPICIOUS SEQUENCES  (suspicious events <= 3s apart)")
