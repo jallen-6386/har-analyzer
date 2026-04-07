@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -338,6 +339,58 @@ def score_request(entry):
                 )
 
     return score, reasons, post_info
+
+
+def extract_iocs(results: dict) -> dict:
+    """
+    Deduplicate and categorize Indicators of Compromise from analysis results.
+    Returns domains, IPs, full URLs, and suspicious cookie names suitable for
+    ingestion into SIEMs, blocklists, or threat intel platforms.
+    """
+    domains = set()
+    ips = set()
+    urls = set()
+    cookie_names = set()
+
+    for req in results.get("suspicious_requests", []):
+        d = req.get("domain", "")
+        u = req.get("url", "")
+        if d:
+            # Separate bare IPs from hostnames
+            try:
+                ipaddress.ip_address(d.split(":")[0])
+                ips.add(d)
+            except ValueError:
+                domains.add(d)
+        if u:
+            urls.add(u)
+
+    for finding in results.get("exfil_findings", []):
+        u = finding.get("url", "")
+        if u:
+            urls.add(u)
+            d = get_domain(u)
+            if d:
+                try:
+                    ipaddress.ip_address(d.split(":")[0])
+                    ips.add(d)
+                except ValueError:
+                    domains.add(d)
+
+    for c in results.get("suspicious_cookies", []):
+        name = c.get("cookie", "")
+        if name:
+            cookie_names.add(name)
+        d = c.get("domain", "")
+        if d:
+            domains.add(d)
+
+    return {
+        "suspicious_domains": sorted(domains),
+        "suspicious_ips": sorted(ips),
+        "suspicious_urls": sorted(urls),
+        "suspicious_cookie_names": sorted(cookie_names),
+    }
 
 
 def analyze_har(har):
@@ -703,6 +756,32 @@ def print_report(results):
             print(f"[#{a['index']}] {a['method']} {a['status']} {a['url']}")
         print()
 
+    iocs = results.get("iocs", {})
+    if any(iocs.get(k) for k in ("suspicious_domains", "suspicious_ips", "suspicious_urls", "suspicious_cookie_names")):
+        print("IOC SUMMARY  (use --iocs-only for copy-paste ready output)")
+        print("-" * 80)
+        if iocs.get("suspicious_domains"):
+            print(f"  Domains ({len(iocs['suspicious_domains'])}):")
+            for d in iocs["suspicious_domains"][:20]:
+                print(f"    {d}")
+            if len(iocs["suspicious_domains"]) > 20:
+                print(f"    ... {len(iocs['suspicious_domains']) - 20} more")
+        if iocs.get("suspicious_ips"):
+            print(f"  IPs ({len(iocs['suspicious_ips'])}):")
+            for ip in iocs["suspicious_ips"]:
+                print(f"    {ip}")
+        if iocs.get("suspicious_urls"):
+            print(f"  URLs ({len(iocs['suspicious_urls'])}):")
+            for u in iocs["suspicious_urls"][:20]:
+                print(f"    {u}")
+            if len(iocs["suspicious_urls"]) > 20:
+                print(f"    ... {len(iocs['suspicious_urls']) - 20} more")
+        if iocs.get("suspicious_cookie_names"):
+            print(f"  Cookie names ({len(iocs['suspicious_cookie_names'])}):")
+            for c in iocs["suspicious_cookie_names"]:
+                print(f"    {c}")
+        print()
+
     print("CONTENT TYPES")
     print("-" * 80)
     for ct, count in results["content_types"][:15]:
@@ -713,6 +792,7 @@ def main():
     parser = argparse.ArgumentParser(description="Advanced HAR analyzer for phishing/token theft investigations")
     parser.add_argument("har_file", help="Path to HAR file")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser.add_argument("--iocs-only", action="store_true", help="Output deduplicated IOC list only (domains, IPs, URLs, cookies)")
     args = parser.parse_args()
 
     try:
@@ -731,7 +811,23 @@ def main():
         print(f"Error analyzing HAR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if args.json:
+    iocs = extract_iocs(results)
+    results["iocs"] = iocs
+
+    if args.iocs_only:
+        print("# SUSPICIOUS DOMAINS")
+        for d in iocs["suspicious_domains"]:
+            print(d)
+        print("\n# SUSPICIOUS IPs")
+        for ip in iocs["suspicious_ips"]:
+            print(ip)
+        print("\n# SUSPICIOUS URLs")
+        for u in iocs["suspicious_urls"]:
+            print(u)
+        print("\n# SUSPICIOUS COOKIE NAMES")
+        for c in iocs["suspicious_cookie_names"]:
+            print(c)
+    elif args.json:
         print(json.dumps(results, indent=2))
     else:
         print_report(results)
