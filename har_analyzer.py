@@ -450,10 +450,23 @@ def analyze_har(har):
     content_types = Counter()
     tracker_domains = set()
 
+    # Prefer the page URL from HAR metadata (most reliable), then fall back to
+    # the most-requested domain across all entries (more robust than first entry,
+    # which is often a redirect, analytics ping, or preflight request).
     top_level_domain = None
-    if entries:
-        first_url = safe_get(entries[0], "request", "url", default="")
-        top_level_domain = get_domain(first_url)
+    pages = safe_get(har, "log", "pages", default=[])
+    if pages:
+        page_title_url = pages[0].get("title", "") or ""
+        if page_title_url.startswith("http"):
+            top_level_domain = get_domain(page_title_url)
+    if not top_level_domain and entries:
+        domain_counts: Counter = Counter()
+        for e in entries:
+            d = get_domain(safe_get(e, "request", "url", default=""))
+            if d:
+                domain_counts[d] += 1
+        if domain_counts:
+            top_level_domain = domain_counts.most_common(1)[0][0]
 
     for idx, entry in enumerate(entries, start=1):
         request = entry.get("request", {})
