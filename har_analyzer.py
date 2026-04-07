@@ -266,6 +266,16 @@ def parse_post_data(post_data):
     return result
 
 
+def severity_label(score: int) -> str:
+    if score >= 12:
+        return "CRITICAL"
+    if score >= 8:
+        return "HIGH"
+    if score >= 4:
+        return "MEDIUM"
+    return "INFO"
+
+
 def score_request(entry):
     """
     Basic heuristic risk score.
@@ -496,6 +506,7 @@ def analyze_har(har):
             suspicious_requests.append({
                 "index": idx,
                 "score": score,
+                "severity": severity_label(score),
                 "method": method,
                 "status": status,
                 "domain": domain,
@@ -591,6 +602,8 @@ def analyze_har(har):
     if not assessment:
         assessment.append("No strong phishing/token-theft indicators found by heuristic scoring")
 
+    severity_counts = Counter(r["severity"] for r in suspicious_requests)
+
     return {
         "summary": {
             "total_entries": len(entries),
@@ -598,6 +611,11 @@ def analyze_har(har):
             "top_level_domain": top_level_domain,
             "total_redirects": len(redirects),
             "total_suspicious_requests": len(suspicious_requests),
+            "severity_breakdown": {
+                "CRITICAL": severity_counts.get("CRITICAL", 0),
+                "HIGH": severity_counts.get("HIGH", 0),
+                "MEDIUM": severity_counts.get("MEDIUM", 0),
+            },
             "total_auth_related_requests": len(auth_related),
             "total_js_hits": len(js_hits),
             "total_cookies_seen": len(cookies_seen),
@@ -644,7 +662,9 @@ def print_report(results):
     print(f"Unique domains:               {s['unique_domains']}")
     print(f"Top-level domain:             {s['top_level_domain']}")
     print(f"Redirects:                    {s['total_redirects']}")
-    print(f"Suspicious requests:          {s['total_suspicious_requests']}")
+    sev = s.get("severity_breakdown", {})
+    print(f"Suspicious requests:          {s['total_suspicious_requests']}  "
+          f"[CRITICAL:{sev.get('CRITICAL',0)}  HIGH:{sev.get('HIGH',0)}  MEDIUM:{sev.get('MEDIUM',0)}]")
     print(f"Auth-related requests:        {s['total_auth_related_requests']}")
     print(f"Suspicious JS responses:      {s['total_js_hits']}")
     print(f"Cookies observed:             {s['total_cookies_seen']}")
@@ -671,7 +691,7 @@ def print_report(results):
         print("  Credentials or tokens were POSTed to a domain different from the page origin.")
         print("  This is the primary indicator of a reverse-proxy phishing kit.\n")
         for req in results["cross_origin_posts"]:
-            print(f"  [#{req['index']}] Score={req['score']}  {req['method']} {req['status']}  {req['url']}")
+            print(f"  [#{req['index']}] [{req.get('severity', '?')}] Score={req['score']}  {req['method']} {req['status']}  {req['url']}")
             for reason in req["reasons"]:
                 if "CROSS-ORIGIN" in reason:
                     print(f"    !! {reason}")
@@ -749,7 +769,7 @@ def print_report(results):
         print("SUSPICIOUS REQUESTS")
         print("-" * 80)
         for req in results["suspicious_requests"][:15]:
-            print(f"[#{req['index']}] Score={req['score']} {req['method']} {req['status']} {req['url']}")
+            print(f"[#{req['index']}] [{req.get('severity', '?')}] Score={req['score']} {req['method']} {req['status']} {req['url']}")
             for reason in req["reasons"]:
                 print(f"   - {reason}")
 
