@@ -1048,56 +1048,81 @@ def print_report(results):
         print(f"  ... showing 15 of {len(cts)} content types (use --json for full list)")
 
 
+def process_har_file(har_path: str, analyst: str, case_id: str) -> dict:
+    """Load, analyze, and enrich a single HAR file. Returns the full results dict."""
+    try:
+        with open(har_path, "r", encoding="utf-8") as f:
+            har = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: file not found: {har_path}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON in {har_path}: {e}", file=sys.stderr)
+        return None
+
+    try:
+        results = analyze_har(har)
+    except Exception as e:
+        print(f"Error analyzing {har_path}: {e}", file=sys.stderr)
+        return None
+
+    results["iocs"] = extract_iocs(results)
+    results["mitre_attack"] = map_mitre_attack(results)
+    results["chain_of_custody"] = build_chain_of_custody(har_path, analyst, case_id)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Advanced HAR analyzer for phishing/token theft investigations")
-    parser.add_argument("har_file", help="Path to HAR file")
+    parser.add_argument("har_files", nargs="+", help="Path(s) to HAR file(s) — accepts multiple files for batch analysis")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--iocs-only", action="store_true", help="Output deduplicated IOC list only (domains, IPs, URLs, cookies)")
     parser.add_argument("--analyst", default="", help="Analyst name for chain-of-custody metadata")
     parser.add_argument("--case-id", default="", help="Case/ticket ID for chain-of-custody metadata")
     args = parser.parse_args()
 
-    try:
-        with open(args.har_file, "r", encoding="utf-8") as f:
-            har = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: file not found: {args.har_file}", file=sys.stderr)
+    all_results = []
+    for har_path in args.har_files:
+        results = process_har_file(har_path, args.analyst, args.case_id)
+        if results:
+            all_results.append(results)
+
+    if not all_results:
         sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"Error: invalid JSON HAR file: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        results = analyze_har(har)
-    except Exception as e:
-        print(f"Error analyzing HAR: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    iocs = extract_iocs(results)
-    results["iocs"] = iocs
-
-    results["mitre_attack"] = map_mitre_attack(results)
-
-    custody = build_chain_of_custody(args.har_file, args.analyst, args.case_id)
-    results["chain_of_custody"] = custody
 
     if args.iocs_only:
+        # Merge IOCs across all files and deduplicate
+        merged_domains: set = set()
+        merged_ips: set = set()
+        merged_urls: set = set()
+        merged_cookies: set = set()
+        for r in all_results:
+            iocs = r.get("iocs", {})
+            merged_domains.update(iocs.get("suspicious_domains", []))
+            merged_ips.update(iocs.get("suspicious_ips", []))
+            merged_urls.update(iocs.get("suspicious_urls", []))
+            merged_cookies.update(iocs.get("suspicious_cookie_names", []))
         print("# SUSPICIOUS DOMAINS")
-        for d in iocs["suspicious_domains"]:
+        for d in sorted(merged_domains):
             print(d)
         print("\n# SUSPICIOUS IPs")
-        for ip in iocs["suspicious_ips"]:
+        for ip in sorted(merged_ips):
             print(ip)
         print("\n# SUSPICIOUS URLs")
-        for u in iocs["suspicious_urls"]:
+        for u in sorted(merged_urls):
             print(u)
         print("\n# SUSPICIOUS COOKIE NAMES")
-        for c in iocs["suspicious_cookie_names"]:
+        for c in sorted(merged_cookies):
             print(c)
     elif args.json:
-        print(json.dumps(results, indent=2))
+        output = all_results[0] if len(all_results) == 1 else all_results
+        print(json.dumps(output, indent=2))
     else:
-        print_report(results)
+        for results in all_results:
+            if len(all_results) > 1:
+                print("\n" + "=" * 80)
+                print(f"FILE: {results['chain_of_custody']['har_file']}")
+            print_report(results)
 
 
 if __name__ == "__main__":
