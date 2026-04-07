@@ -316,6 +316,20 @@ def score_request(entry):
             reasons.append(f"Suspicious endpoint path matched: {pat}")
             break
 
+    # Bare IP address as host — phishing kits often skip DNS to evade blocklists
+    hostname = domain.split(":")[0]
+    try:
+        ipaddress.ip_address(hostname)
+        score += 3
+        reasons.append(f"Bare IP address used as host: {hostname} — common in phishing kits to evade DNS blocklists")
+    except ValueError:
+        pass
+
+    # Punycode / IDN homograph domain
+    if "xn--" in domain:
+        score += 3
+        reasons.append(f"Punycode/IDN domain detected: {domain} — possible homograph phishing attack")
+
     if cred_hits:
         score += 4
         reasons.append(f"Credential-like fields: {', '.join(cred_hits)}")
