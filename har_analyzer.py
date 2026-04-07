@@ -149,6 +149,61 @@ def flag_rapid_sequences(timeline: list, threshold_ms: int = 3000) -> list:
     ]
 
 
+def detect_beaconing(entries: list, min_requests: int = 4, jitter_pct: float = 0.15) -> list:
+    """
+    Detect periodic (beaconing) request patterns per domain.
+    A domain is flagged if it receives >= min_requests with timestamps and the
+    coefficient of variation (stddev / mean) of inter-request intervals is
+    below jitter_pct — indicating clock-driven, automated traffic rather than
+    human browsing. Returns a list of flagged domain findings.
+    """
+    domain_times: defaultdict = defaultdict(list)
+
+    for entry in entries:
+        ts_str = entry.get("startedDateTime", "")
+        dt = parse_har_timestamp(ts_str)
+        if not dt:
+            continue
+        url = safe_get(entry, "request", "url", default="")
+        domain = get_domain(url)
+        if domain:
+            domain_times[domain].append(dt)
+
+    beacons = []
+    for domain, times in domain_times.items():
+        if len(times) < min_requests:
+            continue
+        times_sorted = sorted(times)
+        intervals_ms = [
+            (times_sorted[i] - times_sorted[i - 1]).total_seconds() * 1000
+            for i in range(1, len(times_sorted))
+        ]
+        if not intervals_ms:
+            continue
+        mean_ms = sum(intervals_ms) / len(intervals_ms)
+        if mean_ms < 100:
+            # Ignore burst-loading (sub-100ms gaps are parallel asset loads)
+            continue
+        variance = sum((x - mean_ms) ** 2 for x in intervals_ms) / len(intervals_ms)
+        stddev_ms = variance ** 0.5
+        cv = stddev_ms / mean_ms if mean_ms else 1.0
+        if cv <= jitter_pct:
+            beacons.append({
+                "domain": domain,
+                "request_count": len(times),
+                "mean_interval_ms": round(mean_ms),
+                "stddev_ms": round(stddev_ms),
+                "coefficient_of_variation": round(cv, 4),
+                "finding": (
+                    f"Domain contacted {len(times)} times at a mean interval of "
+                    f"{round(mean_ms)}ms (CV={round(cv, 4)}) — consistent with "
+                    "automated beaconing or C2/skimmer exfil"
+                ),
+            })
+
+    return sorted(beacons, key=lambda x: x["coefficient_of_variation"])
+
+
 def safe_get(dct, *keys, default=None):
     cur = dct
     for k in keys:
@@ -679,6 +734,9 @@ def analyze_har(har):
     timeline = build_timeline(entries, suspicious_indices)
     rapid_sequences = flag_rapid_sequences(timeline)
 
+    # Beaconing detection
+    beacon_findings = detect_beaconing(entries)
+
     # Reverse-proxy phishing heuristics
     reverse_proxy_indicators = []
     suspicious_auth_posts = [
@@ -741,6 +799,11 @@ def analyze_har(har):
             )
         else:
             assessment.append(f"{len(fake_login_pages)} HTML page(s) contain password input fields")
+    if beacon_findings:
+        assessment.append(
+            f"{len(beacon_findings)} domain(s) show periodic beaconing patterns — "
+            "possible C2 channel or skimmer exfiltration"
+        )
     if js_hits:
         assessment.append("Suspicious JavaScript patterns present")
     if tracker_domains:
@@ -769,6 +832,7 @@ def analyze_har(har):
             "total_rapid_sequences": len(rapid_sequences),
             "total_cross_origin_posts": len(cross_origin_posts),
             "total_fake_login_pages": len(fake_login_pages),
+            "total_beacon_findings": len(beacon_findings),
         },
         "assessment": assessment,
         "domains": all_domains.most_common(),
@@ -786,6 +850,7 @@ def analyze_har(har):
         "rapid_sequences": rapid_sequences,
         "cross_origin_posts": cross_origin_posts,
         "fake_login_pages": fake_login_pages,
+        "beacon_findings": beacon_findings,
         "third_party_domains": {k: sorted(v) for k, v in request_domain_to_targets.items()},
     }
 
@@ -821,6 +886,7 @@ def print_report(results):
     print(f"Rapid suspicious sequences:   {s['total_rapid_sequences']}")
     print(f"Cross-origin POSTs:           {s['total_cross_origin_posts']}")
     print(f"Fake login pages detected:    {s['total_fake_login_pages']}")
+    print(f"Beaconing domains detected:   {s['total_beacon_findings']}")
     print()
 
     print("ASSESSMENT")
@@ -889,6 +955,18 @@ def print_report(results):
         total = len(results["fake_login_pages"])
         if total > 20:
             print(f"  ... {total - 20} more (use --json for full output)")
+        print()
+
+    if results.get("beacon_findings"):
+        print("BEACONING / PERIODIC REQUEST PATTERNS")
+        print("-" * 80)
+        print("  Domains contacted at suspiciously regular intervals (low jitter),")
+        print("  consistent with automated C2 callbacks or skimmer exfil beacons.\n")
+        for b in results["beacon_findings"]:
+            print(f"  {b['domain']}")
+            print(f"    {b['finding']}")
+            print(f"    Requests: {b['request_count']}  Mean interval: {b['mean_interval_ms']}ms  "
+                  f"Stddev: {b['stddev_ms']}ms  CV: {b['coefficient_of_variation']}")
         print()
 
     if results["rapid_sequences"]:
