@@ -461,6 +461,7 @@ def analyze_har(har):
     cookies_seen = []
     auth_related = []
     js_hits = []
+    fake_login_pages = []
     content_types = Counter()
     tracker_domains = set()
 
@@ -572,6 +573,33 @@ def analyze_har(har):
                         "matches": sorted(set(hits)),
                     })
 
+        # HTML response inspection — detect fake login forms
+        if "text/html" in mime or path.endswith(".html") or path.endswith(".htm"):
+            text = str(content.get("text", "") or "")
+            if text:
+                has_password_input = bool(re.search(r'<input[^>]+type=["\']password["\']', text, re.IGNORECASE))
+                form_actions = re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', text, re.IGNORECASE)
+                offsite_actions = [
+                    action for action in form_actions
+                    if action.startswith("http") and get_domain(action) not in ("", domain)
+                ]
+                if has_password_input and offsite_actions:
+                    fake_login_pages.append({
+                        "index": idx,
+                        "url": url,
+                        "domain": domain,
+                        "offsite_form_actions": offsite_actions,
+                        "finding": "HTML page contains password input with form action pointing to a different domain",
+                    })
+                elif has_password_input and form_actions:
+                    fake_login_pages.append({
+                        "index": idx,
+                        "url": url,
+                        "domain": domain,
+                        "offsite_form_actions": form_actions,
+                        "finding": "HTML page contains password input field",
+                    })
+
     # Cross-origin POST findings (extracted from scored suspicious requests)
     cross_origin_posts = [
         r for r in suspicious_requests
@@ -635,6 +663,16 @@ def analyze_har(har):
         assessment.append("Potential data exfiltration present in request bodies")
     if reverse_proxy_indicators:
         assessment.append("Possible reverse-proxy phishing or session theft behavior")
+    if fake_login_pages:
+        cross_origin_forms = [p for p in fake_login_pages if p["offsite_form_actions"] and
+                              any(get_domain(a) not in ("", p["domain"]) for a in p["offsite_form_actions"])]
+        if cross_origin_forms:
+            assessment.append(
+                f"CRITICAL: {len(cross_origin_forms)} HTML page(s) contain password fields with "
+                "form actions pointing to a different domain — fake login page indicator"
+            )
+        else:
+            assessment.append(f"{len(fake_login_pages)} HTML page(s) contain password input fields")
     if js_hits:
         assessment.append("Suspicious JavaScript patterns present")
     if tracker_domains:
@@ -662,6 +700,7 @@ def analyze_har(har):
             "total_exfil_findings": len(exfil_findings),
             "total_rapid_sequences": len(rapid_sequences),
             "total_cross_origin_posts": len(cross_origin_posts),
+            "total_fake_login_pages": len(fake_login_pages),
         },
         "assessment": assessment,
         "domains": all_domains.most_common(),
@@ -678,6 +717,7 @@ def analyze_har(har):
         "timeline": timeline,
         "rapid_sequences": rapid_sequences,
         "cross_origin_posts": cross_origin_posts,
+        "fake_login_pages": fake_login_pages,
         "third_party_domains": {k: sorted(v) for k, v in request_domain_to_targets.items()},
     }
 
@@ -712,6 +752,7 @@ def print_report(results):
     print(f"Exfil findings:               {s['total_exfil_findings']}")
     print(f"Rapid suspicious sequences:   {s['total_rapid_sequences']}")
     print(f"Cross-origin POSTs:           {s['total_cross_origin_posts']}")
+    print(f"Fake login pages detected:    {s['total_fake_login_pages']}")
     print()
 
     print("ASSESSMENT")
@@ -753,6 +794,19 @@ def print_report(results):
                 fields_preview = ", ".join(list(req["parsed_fields"].keys())[:8])
                 print(f"    Fields: {fields_preview}")
         total = len(results["cross_origin_posts"])
+        if total > 20:
+            print(f"  ... {total - 20} more (use --json for full output)")
+        print()
+
+    if results.get("fake_login_pages"):
+        print("FAKE LOGIN PAGE INDICATORS")
+        print("-" * 80)
+        for p in results["fake_login_pages"][:20]:
+            print(f"  [#{p['index']}] {p['url']}")
+            print(f"    Finding: {p['finding']}")
+            for action in p["offsite_form_actions"][:5]:
+                print(f"    Form action: {action}")
+        total = len(results["fake_login_pages"])
         if total > 20:
             print(f"  ... {total - 20} more (use --json for full output)")
         print()
