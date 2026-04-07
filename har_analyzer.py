@@ -763,8 +763,11 @@ def print_report(results):
 
     print("TOP DOMAINS")
     print("-" * 80)
-    for domain, count in results["domains"][:20]:
+    all_domains = results["domains"]
+    for domain, count in all_domains[:20]:
         print(f"{domain:<50} {count}")
+    if len(all_domains) > 20:
+        print(f"  ... showing 20 of {len(all_domains)} domains (use --json for full list)")
     print()
 
     third_party = results.get("third_party_domains", {})
@@ -860,23 +863,30 @@ def print_report(results):
         print()
 
     if results["redirects"]:
+        redirects = results["redirects"]
         print("REDIRECTS")
         print("-" * 80)
-        for r in results["redirects"][:20]:
+        for r in redirects[:20]:
             print(f"[#{r['index']}] {r['status']}  {r['from_url']}  -->  {r['to_url']}")
+        if len(redirects) > 20:
+            print(f"  ... showing 20 of {len(redirects)} redirects (use --json for full list)")
         print()
 
     if results["exfil_findings"]:
+        exfil = results["exfil_findings"]
         print("POSSIBLE EXFIL FINDINGS")
         print("-" * 80)
-        for f in results["exfil_findings"][:20]:
+        for f in exfil[:20]:
             print(f"[#{f['index']}] {f['type']}: {f['url']}")
+        if len(exfil) > 20:
+            print(f"  ... showing 20 of {len(exfil)} findings (use --json for full list)")
         print()
 
     if results["suspicious_requests"]:
+        reqs = results["suspicious_requests"]
         print("SUSPICIOUS REQUESTS")
         print("-" * 80)
-        for req in results["suspicious_requests"][:15]:
+        for req in reqs[:15]:
             print(f"[#{req['index']}] [{req.get('severity', '?')}] Score={req['score']} {req['method']} {req['status']} {req['url']}")
             for reason in req["reasons"]:
                 print(f"   - {reason}")
@@ -891,27 +901,39 @@ def print_report(results):
                 excerpt = req["raw_body_excerpt"].replace("\n", "\\n")
                 print(f"   Body excerpt: {excerpt[:220]}")
             print()
+        if len(reqs) > 15:
+            print(f"  ... showing 15 of {len(reqs)} suspicious requests (use --json for full list)")
+            print()
 
     if results["suspicious_cookies"]:
+        scookies = results["suspicious_cookies"]
         print("SUSPICIOUS COOKIES")
         print("-" * 80)
-        for c in results["suspicious_cookies"][:20]:
+        for c in scookies[:20]:
             print(f"[#{c['index']}] {c['domain']} -> {c['cookie']} | {c['raw']}")
+        if len(scookies) > 20:
+            print(f"  ... showing 20 of {len(scookies)} suspicious cookies (use --json for full list)")
         print()
 
     if results["javascript_hits"]:
+        js = results["javascript_hits"]
         print("SUSPICIOUS JAVASCRIPT HITS")
         print("-" * 80)
-        for j in results["javascript_hits"][:20]:
+        for j in js[:20]:
             print(f"[#{j['index']}] {j['url']}")
             print(f"   Matches: {', '.join(j['matches'])}")
+        if len(js) > 20:
+            print(f"  ... showing 20 of {len(js)} JS hits (use --json for full list)")
         print()
 
     if results["auth_related_requests"]:
+        auth = results["auth_related_requests"]
         print("AUTH-RELATED REQUESTS")
         print("-" * 80)
-        for a in results["auth_related_requests"][:25]:
+        for a in auth[:25]:
             print(f"[#{a['index']}] {a['method']} {a['status']} {a['url']}")
+        if len(auth) > 25:
+            print(f"  ... showing 25 of {len(auth)} auth-related requests (use --json for full list)")
         print()
 
     iocs = results.get("iocs", {})
@@ -940,10 +962,13 @@ def print_report(results):
                 print(f"    {c}")
         print()
 
+    cts = results["content_types"]
     print("CONTENT TYPES")
     print("-" * 80)
-    for ct, count in results["content_types"][:15]:
+    for ct, count in cts[:15]:
         print(f"{ct:<60} {count}")
+    if len(cts) > 15:
+        print(f"  ... showing 15 of {len(cts)} content types (use --json for full list)")
 
 
 def main():
